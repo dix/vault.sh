@@ -68,7 +68,7 @@ done
 debug "Starting Vault secret retrieval"
 debug "CLI arguments parsed"
 
-: "${VAULT_ADDR:-PLACEHOLDER_DEFAULT_VAULT_ADDR}"
+VAULT_ADDR="${VAULT_ADDR:-PLACEHOLDER_DEFAULT_VAULT_ADDR}"
 : "${VAULT_ROLE_ID:?Missing VAULT_ROLE_ID}"
 : "${VAULT_SECRET_ID:?Missing VAULT_SECRET_ID}"
 : "${SECRET_PATH:?Missing secret path (use --path)}"
