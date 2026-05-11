@@ -40,7 +40,11 @@ MOUNT_POINT="${VAULT_MOUNT_POINT:-secret}"
 SECRET_PATH="${VAULT_SECRET_PATH:-}"
 SECRET_KEY="${VAULT_SECRET_KEY:-}"
 GET_SECRET=""
+PUT_SECRET=""
+PUT_VALUE=""
 KEY_SET="0"
+ACTION="get"
+DEFAULT_PUT_KEY="${VAULT_DEFAULT_PUT_KEY:-value}"
 
 print_help() {
   cat <<'EOF'
@@ -51,6 +55,8 @@ Usage:
 
 Options:
   --get-secret <path>    Full Vault API path (/v1/<mount>/data/<path>)
+  --put-secret <path>    Full Vault API path (/v1/<mount>/data/<path>) to write
+  --value <value>        Value to write (used with --put-secret)
   --mount-point <name>   KV v2 mount point (default: VAULT_MOUNT_POINT or secret)
   --path <path>          Secret path inside KV v2
   --key <key>            Secret field key to extract
@@ -79,6 +85,14 @@ How secret targeting works:
 
   2) Explicit: --mount-point + --path (+ optional --key)
 
+Write mode (--put-secret) guessing rules:
+  - If key is present in path (#key or ?key=key), update that key.
+  - Else if --value is a JSON object, write it as the whole secret object.
+  - Else if secret exists and has exactly one key, update that key.
+  - Else if secret exists and has multiple keys, fail as ambiguous.
+  - Else (secret does not exist), create with default key "value"
+    (overridable via VAULT_DEFAULT_PUT_KEY).
+
 Priority rules:
   - If --get-secret is provided, it sets mount/path automatically.
   - If --key is explicitly provided, it overrides key from --get-secret.
@@ -91,6 +105,12 @@ Priority rules:
 Examples:
   # Full path parsing
   ./vault.sh --get-secret "/v1/secret/data/team/app"
+
+  # Put scalar with key in path
+  ./vault.sh --put-secret "/v1/secret/data/team/app#token" --value "s3cr3t"
+
+  # Put whole object
+  ./vault.sh --put-secret "/v1/secret/data/team/app" --value '{"user":"alice","token":"abc"}'
 
   # Full URL + key in fragment
   ./vault.sh --get-secret "https://vault.example.com/v1/secret/data/team/app#token"
@@ -108,7 +128,7 @@ Common troubleshooting:
 EOF
 }
 
-parse_get_secret() {
+parse_secret_target() {
   local raw="$1"
   local key_is_explicit="$2"
   local parsed="$raw"
@@ -141,14 +161,14 @@ parse_get_secret() {
   fi
 
   if [[ "$parsed" != */data/* ]]; then
-    fail "--get-secret must look like /v1/<mount>/data/<path>"
+    fail "Secret target must look like /v1/<mount>/data/<path>"
   fi
 
   parsed_mount="${parsed%%/data/*}"
   parsed_path="${parsed#*/data/}"
 
   if [[ -z "$parsed_mount" || -z "$parsed_path" ]]; then
-    fail "Unable to parse mount/path from --get-secret '${raw}'"
+    fail "Unable to parse mount/path from secret target '${raw}'"
   fi
 
   MOUNT_POINT="$parsed_mount"
@@ -163,7 +183,7 @@ parse_get_secret() {
     fi
   fi
 
-  debug "Parsed --get-secret mount=${MOUNT_POINT} path=${SECRET_PATH} key=${SECRET_KEY:-<none>}"
+  debug "Parsed secret target mount=${MOUNT_POINT} path=${SECRET_PATH} key=${SECRET_KEY:-<none>}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -183,6 +203,16 @@ while [[ $# -gt 0 ]]; do
       ;;
     --get-secret)
       GET_SECRET="$2"
+      ACTION="get"
+      shift 2
+      ;;
+    --put-secret)
+      PUT_SECRET="$2"
+      ACTION="put"
+      shift 2
+      ;;
+    --value)
+      PUT_VALUE="$2"
       shift 2
       ;;
     --debug)
@@ -201,17 +231,27 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$GET_SECRET" && -n "$PUT_SECRET" ]]; then
+  fail "Use either --get-secret or --put-secret, not both"
+fi
+
 if [[ -n "$GET_SECRET" ]]; then
-  parse_get_secret "$GET_SECRET" "$KEY_SET"
+  parse_secret_target "$GET_SECRET" "$KEY_SET"
+elif [[ -n "$PUT_SECRET" ]]; then
+  parse_secret_target "$PUT_SECRET" "$KEY_SET"
 fi
 
 debug "Starting Vault secret retrieval"
 debug "CLI arguments parsed"
 
 VAULT_ADDR="${VAULT_ADDR:-PLACEHOLDER_DEFAULT_VAULT_ADDR}"
+VAULT_ADDR="${VAULT_ADDR%/}"
 : "${VAULT_ROLE_ID:?Missing VAULT_ROLE_ID}"
 : "${VAULT_SECRET_ID:?Missing VAULT_SECRET_ID}"
 : "${SECRET_PATH:?Missing secret path (use --path)}"
+if [[ "$ACTION" == "put" ]]; then
+  : "${PUT_VALUE:?Missing value (use --value)}"
+fi
 
 for bin in curl jq; do
   if ! command -v "$bin" >/dev/null 2>&1; then
@@ -283,58 +323,189 @@ debug "Vault token acquired successfully (masked=$(mask "$TOKEN"), length=${#TOK
 
 READ_HEADERS+=(-H "X-Vault-Token: ${TOKEN}")
 READ_URL="${VAULT_ADDR}/v1/${MOUNT_POINT}/data/${SECRET_PATH}"
-debug "Reading secret from ${READ_URL}"
+if [[ "$ACTION" == "get" ]]; then
+  debug "Reading secret from ${READ_URL}"
 
-if ! READ_RESP="$({
-  curl -sS \
-    --location \
-    --max-redirs 5 \
-    "${READ_HEADERS[@]}" \
-    --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
-    "$READ_URL"
-})"; then
-  fail "Secret read request failed (network/TLS/connection issue)"
-fi
-
-READ_REDIRECTS="${READ_RESP##*$'\n'}"
-READ_TMP="${READ_RESP%$'\n'*}"
-READ_EFFECTIVE_URL="${READ_TMP##*$'\n'}"
-READ_TMP="${READ_TMP%$'\n'*}"
-READ_STATUS="${READ_TMP##*$'\n'}"
-RESP="${READ_TMP%$'\n'*}"
-debug "Read response HTTP status=${READ_STATUS}"
-debug "Read effective URL=${READ_EFFECTIVE_URL} redirects=${READ_REDIRECTS}"
-debug "Read response body=${RESP}"
-
-if [[ ! "$READ_STATUS" =~ ^2 ]]; then
-  if ERRORS="$(jq -r '.errors[]?' <<<"$RESP" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
-    log_line "ERROR" "Vault errors: ${ERRORS}"
+  if ! READ_RESP="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      "${READ_HEADERS[@]}" \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "$READ_URL"
+  })"; then
+    fail "Secret read request failed (network/TLS/connection issue)"
   fi
-  fail "Vault secret read failed with HTTP ${READ_STATUS}"
-fi
 
-if [[ -n "$SECRET_KEY" ]]; then
-  debug "Extracting single key '${SECRET_KEY}'"
-  VALUE_TYPE="$(jq -er --arg k "$SECRET_KEY" '.data.data[$k] | type' <<<"$RESP")"
-  if [[ "$VALUE_TYPE" == "object" || "$VALUE_TYPE" == "array" ]]; then
-    jq -e --arg k "$SECRET_KEY" '.data.data[$k]' <<<"$RESP"
-  else
-    jq -er --arg k "$SECRET_KEY" '.data.data[$k]' <<<"$RESP"
+  READ_REDIRECTS="${READ_RESP##*$'\n'}"
+  READ_TMP="${READ_RESP%$'\n'*}"
+  READ_EFFECTIVE_URL="${READ_TMP##*$'\n'}"
+  READ_TMP="${READ_TMP%$'\n'*}"
+  READ_STATUS="${READ_TMP##*$'\n'}"
+  RESP="${READ_TMP%$'\n'*}"
+  debug "Read response HTTP status=${READ_STATUS}"
+  debug "Read effective URL=${READ_EFFECTIVE_URL} redirects=${READ_REDIRECTS}"
+  debug "Read response body=${RESP}"
+
+  if [[ ! "$READ_STATUS" =~ ^2 ]]; then
+    if ERRORS="$(jq -r '.errors[]?' <<<"$RESP" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
+      log_line "ERROR" "Vault errors: ${ERRORS}"
+    fi
+    fail "Vault secret read failed with HTTP ${READ_STATUS}"
   fi
-else
-  KEY_COUNT="$(jq -er '.data.data | keys | length' <<<"$RESP")"
-  if [[ "$KEY_COUNT" -eq 1 ]]; then
-    debug "Single-key secret detected; printing value only"
-    VALUE_TYPE="$(jq -er '.data.data | to_entries[0].value | type' <<<"$RESP")"
+
+  if [[ -n "$SECRET_KEY" ]]; then
+    debug "Extracting single key '${SECRET_KEY}'"
+    VALUE_TYPE="$(jq -er --arg k "$SECRET_KEY" '.data.data[$k] | type' <<<"$RESP")"
     if [[ "$VALUE_TYPE" == "object" || "$VALUE_TYPE" == "array" ]]; then
-      jq -e '.data.data | to_entries[0].value' <<<"$RESP"
+      jq -e --arg k "$SECRET_KEY" '.data.data[$k]' <<<"$RESP"
     else
-      jq -er '.data.data | to_entries[0].value' <<<"$RESP"
+      jq -er --arg k "$SECRET_KEY" '.data.data[$k]' <<<"$RESP"
     fi
   else
-    debug "Multi-key secret detected; printing full JSON object"
-    jq -e '.data.data' <<<"$RESP"
+    KEY_COUNT="$(jq -er '.data.data | keys | length' <<<"$RESP")"
+    if [[ "$KEY_COUNT" -eq 1 ]]; then
+      debug "Single-key secret detected; printing value only"
+      VALUE_TYPE="$(jq -er '.data.data | to_entries[0].value | type' <<<"$RESP")"
+      if [[ "$VALUE_TYPE" == "object" || "$VALUE_TYPE" == "array" ]]; then
+        jq -e '.data.data | to_entries[0].value' <<<"$RESP"
+      else
+        jq -er '.data.data | to_entries[0].value' <<<"$RESP"
+      fi
+    else
+      debug "Multi-key secret detected; printing full JSON object"
+      jq -e '.data.data' <<<"$RESP"
+    fi
   fi
+else
+  debug "Preparing put-secret operation for ${READ_URL}"
+  debug "Raw --value input=${PUT_VALUE}"
+
+  VALUE_IS_JSON="0"
+  VALUE_JSON=""
+  VALUE_JSON_TYPE=""
+  if VALUE_JSON="$(jq -ce . <<<"$PUT_VALUE" 2>/dev/null)"; then
+    VALUE_IS_JSON="1"
+    VALUE_JSON_TYPE="$(jq -r 'type' <<<"$VALUE_JSON")"
+    debug "--value parsed as JSON type=${VALUE_JSON_TYPE}"
+  else
+    debug "--value is treated as plain string"
+  fi
+
+  if ! CURRENT_RESP="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      "${READ_HEADERS[@]}" \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "$READ_URL"
+  })"; then
+    fail "Secret pre-read request failed (network/TLS/connection issue)"
+  fi
+
+  CURRENT_REDIRECTS="${CURRENT_RESP##*$'\n'}"
+  CURRENT_TMP="${CURRENT_RESP%$'\n'*}"
+  CURRENT_EFFECTIVE_URL="${CURRENT_TMP##*$'\n'}"
+  CURRENT_TMP="${CURRENT_TMP%$'\n'*}"
+  CURRENT_STATUS="${CURRENT_TMP##*$'\n'}"
+  CURRENT_BODY="${CURRENT_TMP%$'\n'*}"
+  debug "Pre-read response HTTP status=${CURRENT_STATUS}"
+  debug "Pre-read effective URL=${CURRENT_EFFECTIVE_URL} redirects=${CURRENT_REDIRECTS}"
+  debug "Pre-read response body=${CURRENT_BODY}"
+
+  SECRET_EXISTS="0"
+  EXISTING_DATA='{}'
+  if [[ "$CURRENT_STATUS" =~ ^2 ]]; then
+    SECRET_EXISTS="1"
+    if ! EXISTING_DATA="$(jq -ce '.data.data' <<<"$CURRENT_BODY")"; then
+      fail "Could not parse existing secret object from Vault response"
+    fi
+  elif [[ "$CURRENT_STATUS" == "404" ]]; then
+    debug "Secret does not exist yet; will create it"
+  else
+    if ERRORS="$(jq -r '.errors[]?' <<<"$CURRENT_BODY" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
+      log_line "ERROR" "Vault errors: ${ERRORS}"
+    fi
+    fail "Vault secret pre-read failed with HTTP ${CURRENT_STATUS}"
+  fi
+
+  TARGET_KEY=""
+  WRITE_DATA_JSON=""
+  if [[ -n "$SECRET_KEY" ]]; then
+    TARGET_KEY="$SECRET_KEY"
+    debug "Using explicit key '${TARGET_KEY}' for write"
+  elif [[ "$VALUE_IS_JSON" == "1" && "$VALUE_JSON_TYPE" == "object" ]]; then
+    WRITE_DATA_JSON="$VALUE_JSON"
+    debug "Value is a JSON object; writing whole object"
+  else
+    if [[ "$SECRET_EXISTS" == "1" ]]; then
+      EXISTING_KEY_COUNT="$(jq -er 'keys | length' <<<"$EXISTING_DATA")"
+      if [[ "$EXISTING_KEY_COUNT" -eq 1 ]]; then
+        TARGET_KEY="$(jq -er 'keys[0]' <<<"$EXISTING_DATA")"
+        debug "Existing secret has one key; updating key '${TARGET_KEY}'"
+      elif [[ "$EXISTING_KEY_COUNT" -eq 0 ]]; then
+        TARGET_KEY="$DEFAULT_PUT_KEY"
+        debug "Existing secret is empty; using default key '${TARGET_KEY}'"
+      else
+        fail "Ambiguous write target: secret has multiple keys. Use #<key>, ?key=<key>, or --key."
+      fi
+    else
+      TARGET_KEY="$DEFAULT_PUT_KEY"
+      debug "Secret does not exist; using default key '${TARGET_KEY}'"
+    fi
+  fi
+
+  if [[ -n "$TARGET_KEY" ]]; then
+    if [[ "$VALUE_IS_JSON" == "1" ]]; then
+      PATCH_JSON="$(jq -cn --arg k "$TARGET_KEY" --argjson v "$VALUE_JSON" '{($k): $v}')"
+    else
+      PATCH_JSON="$(jq -cn --arg k "$TARGET_KEY" --arg v "$PUT_VALUE" '{($k): $v}')"
+    fi
+    debug "Write patch JSON=${PATCH_JSON}"
+    WRITE_DATA_JSON="$(jq -cn --argjson base "$EXISTING_DATA" --argjson patch "$PATCH_JSON" '$base + $patch')"
+  fi
+
+  debug "Resolved write data JSON=${WRITE_DATA_JSON}"
+
+  WRITE_PAYLOAD="$(jq -cn --argjson data "$WRITE_DATA_JSON" '{data: $data}')"
+  debug "Write request URL=${READ_URL}"
+  debug "Write request payload=${WRITE_PAYLOAD}"
+  WRITE_HEADERS=("${READ_HEADERS[@]}" -H "Content-Type: application/json")
+
+  if ! WRITE_RESP="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      --post301 \
+      --post302 \
+      --post303 \
+      "${WRITE_HEADERS[@]}" \
+      --request POST \
+      --data "$WRITE_PAYLOAD" \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "$READ_URL"
+  })"; then
+    fail "Secret write request failed (network/TLS/connection issue)"
+  fi
+
+  WRITE_REDIRECTS="${WRITE_RESP##*$'\n'}"
+  WRITE_TMP="${WRITE_RESP%$'\n'*}"
+  WRITE_EFFECTIVE_URL="${WRITE_TMP##*$'\n'}"
+  WRITE_TMP="${WRITE_TMP%$'\n'*}"
+  WRITE_STATUS="${WRITE_TMP##*$'\n'}"
+  WRITE_BODY="${WRITE_TMP%$'\n'*}"
+  debug "Write response HTTP status=${WRITE_STATUS}"
+  debug "Write effective URL=${WRITE_EFFECTIVE_URL} redirects=${WRITE_REDIRECTS}"
+  debug "Write response body=${WRITE_BODY}"
+
+  if [[ ! "$WRITE_STATUS" =~ ^2 ]]; then
+    if ERRORS="$(jq -r '.errors[]?' <<<"$WRITE_BODY" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
+      log_line "ERROR" "Vault errors: ${ERRORS}"
+    fi
+    fail "Vault secret write failed with HTTP ${WRITE_STATUS}"
+  fi
+
+  jq -e --argjson data "$WRITE_DATA_JSON" '$data' <<<"{}"
 fi
 
 debug "Completed successfully"
