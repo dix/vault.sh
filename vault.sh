@@ -44,11 +44,16 @@ PUT_SECRET=""
 PUT_VALUE=""
 KEY_SET="0"
 ACTION="get"
+TOKEN_INFO="0"
+RENEW_TOKEN="0"
+RENEW_INCREMENT=""
+ENV_FILE=""
+VAULT_AUTH_METHOD="${VAULT_AUTH_METHOD:-}"
 DEFAULT_PUT_KEY="${VAULT_DEFAULT_PUT_KEY:-value}"
 
 print_help() {
   cat <<'EOF'
-vault.sh - Read HashiCorp Vault KV v2 secrets using AppRole
+vault.sh - Read/Write HashiCorp Vault KV v2 secrets
 
 Usage:
   vault.sh [options]
@@ -60,13 +65,22 @@ Options:
   --mount-point <name>   KV v2 mount point (default: VAULT_MOUNT_POINT or secret)
   --path <path>          Secret path inside KV v2
   --key <key>            Secret field key to extract
+  --token-info           Show token TTL, expiry, and renewable status
+  --renew-token          Renew current token (if renewable)
+  --increment <duration> Requested renewal increment (e.g. 30m, 1h)
+  --env-file <path>      Load environment variables from file before execution
   --debug                Enable debug logs
   -h, --help             Show this help
 
 Authentication:
-  - AppRole only, via environment variables:
-      VAULT_ROLE_ID
-      VAULT_SECRET_ID
+  - Auth method via VAULT_AUTH_METHOD (AppRole|token, optional)
+  - If VAULT_AUTH_METHOD is not set, script auto-selects:
+      VAULT_TOKEN set => token
+      VAULT_ROLE_ID and VAULT_SECRET_ID set => AppRole
+  - AppRole requires:
+      VAULT_ROLE_ID + VAULT_SECRET_ID
+  - token uses:
+      VAULT_TOKEN
 
 Connection:
   - VAULT_ADDR defaults to script default if not set.
@@ -121,8 +135,17 @@ Examples:
   # Use key from query parameter
   ./vault.sh --get-secret "/v1/secret/data/team/app?key=password"
 
+  # Show token metadata
+  ./vault.sh --token-info
+
+  # Renew token and request increment
+  ./vault.sh --renew-token --increment 1h
+
+  # Load variables from file
+  ./vault.sh --env-file .vault.env --get-secret "/v1/secret/data/team/app#token"
+
 Common troubleshooting:
-  - Permission denied => AppRole authenticated, but policy lacks read on <mount>/data/<path>.
+  - Permission denied => authenticated, but policy lacks read on <mount>/data/<path>.
   - Redirect/login errors => set VAULT_ADDR to canonical HTTPS endpoint.
   - Missing jq/curl => install required binaries.
 EOF
@@ -186,6 +209,179 @@ parse_secret_target() {
   debug "Parsed secret target mount=${MOUNT_POINT} path=${SECRET_PATH} key=${SECRET_KEY:-<none>}"
 }
 
+load_env_file() {
+  local file_path="$1"
+
+  if [[ ! -f "$file_path" ]]; then
+    fail "Env file not found: ${file_path}"
+  fi
+  if [[ ! -r "$file_path" ]]; then
+    fail "Env file is not readable: ${file_path}"
+  fi
+
+  debug "Loading environment from file=${file_path}"
+  set -a
+  # shellcheck disable=SC1090
+  source "$file_path"
+  set +a
+}
+
+load_token_from_env() {
+  if [[ -n "${VAULT_TOKEN:-}" ]]; then
+    TOKEN="$VAULT_TOKEN"
+    return
+  fi
+
+  fail "Missing token: set VAULT_TOKEN"
+}
+
+auth_with_approle() {
+  : "${VAULT_ROLE_ID:?Missing VAULT_ROLE_ID}"
+  : "${VAULT_SECRET_ID:?Missing VAULT_SECRET_ID}"
+
+  local login_payload login_resp login_redirects login_tmp login_effective_url login_status login_body
+  login_payload="$(jq -n --arg role_id "$VAULT_ROLE_ID" --arg secret_id "$VAULT_SECRET_ID" '{role_id: $role_id, secret_id: $secret_id}')"
+  debug "Authenticating with AppRole at ${VAULT_ADDR}/v1/auth/approle/login"
+
+  if ! login_resp="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      --post301 \
+      --post302 \
+      --post303 \
+      "${AUTH_HEADERS[@]}" \
+      --request POST \
+      --data "$login_payload" \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "${VAULT_ADDR}/v1/auth/approle/login"
+  })"; then
+    fail "Login request failed (network/TLS/connection issue)"
+  fi
+
+  login_redirects="${login_resp##*$'\n'}"
+  login_tmp="${login_resp%$'\n'*}"
+  login_effective_url="${login_tmp##*$'\n'}"
+  login_tmp="${login_tmp%$'\n'*}"
+  login_status="${login_tmp##*$'\n'}"
+  login_body="${login_tmp%$'\n'*}"
+  debug "Login response HTTP status=${login_status}"
+  debug "Login effective URL=${login_effective_url} redirects=${login_redirects}"
+  debug "Login response body=${login_body}"
+
+  if [[ ! "$login_status" =~ ^2 ]]; then
+    fail "Vault AppRole login failed with HTTP ${login_status}"
+  fi
+
+  if ! TOKEN="$(jq -er '.auth.client_token' <<<"$login_body")"; then
+    fail "Login succeeded but token missing in response"
+  fi
+}
+
+resolve_token() {
+  local method="$VAULT_AUTH_METHOD"
+
+  if [[ -z "$method" ]]; then
+    if [[ -n "${VAULT_TOKEN:-}" ]]; then
+      method="token"
+    elif [[ -n "${VAULT_ROLE_ID:-}" && -n "${VAULT_SECRET_ID:-}" ]]; then
+      method="AppRole"
+    else
+      fail "Could not determine auth method. Set VAULT_AUTH_METHOD=token with VAULT_TOKEN, or VAULT_AUTH_METHOD=AppRole with VAULT_ROLE_ID and VAULT_SECRET_ID."
+    fi
+  fi
+
+  VAULT_AUTH_METHOD="$method"
+
+  case "$method" in
+    approle|AppRole)
+      debug "Auth method=AppRole role_id=$(mask "${VAULT_ROLE_ID:-}") secret_id=$(mask "${VAULT_SECRET_ID:-}")"
+      auth_with_approle
+      ;;
+    token)
+      debug "Auth method=token"
+      load_token_from_env
+      ;;
+    *)
+      fail "Unsupported VAULT_AUTH_METHOD='${method}' (expected AppRole or token)"
+      ;;
+  esac
+}
+
+show_token_info() {
+  local lookup_url resp tmp status body redirects effective_url
+  lookup_url="${VAULT_ADDR}/v1/auth/token/lookup-self"
+
+  if ! resp="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      "${READ_HEADERS[@]}" \
+      --request GET \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "${lookup_url}"
+  })"; then
+    fail "Token lookup request failed (network/TLS/connection issue)"
+  fi
+
+  redirects="${resp##*$'\n'}"
+  tmp="${resp%$'\n'*}"
+  effective_url="${tmp##*$'\n'}"
+  tmp="${tmp%$'\n'*}"
+  status="${tmp##*$'\n'}"
+  body="${tmp%$'\n'*}"
+
+  if [[ ! "$status" =~ ^2 ]]; then
+    if ERRORS="$(jq -r '.errors[]?' <<<"$body" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
+      log_line "ERROR" "Vault errors: ${ERRORS}"
+    fi
+    fail "Vault token lookup failed with HTTP ${status}"
+  fi
+
+  jq -e '{ttl: .data.ttl, expire_time: .data.expire_time, renewable: .data.renewable, orphan: .data.orphan, policies: .data.policies}' <<<"$body"
+}
+
+renew_token() {
+  local renew_url resp tmp status body redirects effective_url payload
+  renew_url="${VAULT_ADDR}/v1/auth/token/renew-self"
+
+  if [[ -n "$RENEW_INCREMENT" ]]; then
+    payload="$(jq -cn --arg increment "$RENEW_INCREMENT" '{increment: $increment}')"
+  else
+    payload='{}'
+  fi
+
+  if ! resp="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      "${READ_HEADERS[@]}" \
+      -H "Content-Type: application/json" \
+      --request POST \
+      --data "$payload" \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "${renew_url}"
+  })"; then
+    fail "Token renew request failed (network/TLS/connection issue)"
+  fi
+
+  redirects="${resp##*$'\n'}"
+  tmp="${resp%$'\n'*}"
+  effective_url="${tmp##*$'\n'}"
+  tmp="${tmp%$'\n'*}"
+  status="${tmp##*$'\n'}"
+  body="${tmp%$'\n'*}"
+
+  if [[ ! "$status" =~ ^2 ]]; then
+    if ERRORS="$(jq -r '.errors[]?' <<<"$body" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
+      log_line "ERROR" "Vault errors: ${ERRORS}"
+    fi
+    fail "Vault token renew failed with HTTP ${status}"
+  fi
+
+  jq -e '{renewed: true, ttl: .auth.lease_duration, renewable: .auth.renewable}' <<<"$body"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mount-point)
@@ -219,6 +415,24 @@ while [[ $# -gt 0 ]]; do
       DEBUG="1"
       shift
       ;;
+    --token-info)
+      TOKEN_INFO="1"
+      ACTION="token_info"
+      shift
+      ;;
+    --renew-token)
+      RENEW_TOKEN="1"
+      ACTION="renew_token"
+      shift
+      ;;
+    --increment)
+      RENEW_INCREMENT="$2"
+      shift 2
+      ;;
+    --env-file)
+      ENV_FILE="$2"
+      shift 2
+      ;;
     -h|--help)
       print_help
       exit 0
@@ -230,6 +444,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$ENV_FILE" ]]; then
+  load_env_file "$ENV_FILE"
+fi
 
 if [[ -n "$GET_SECRET" && -n "$PUT_SECRET" ]]; then
   fail "Use either --get-secret or --put-secret, not both"
@@ -246,9 +464,9 @@ debug "CLI arguments parsed"
 
 VAULT_ADDR="${VAULT_ADDR:-PLACEHOLDER_DEFAULT_VAULT_ADDR}"
 VAULT_ADDR="${VAULT_ADDR%/}"
-: "${VAULT_ROLE_ID:?Missing VAULT_ROLE_ID}"
-: "${VAULT_SECRET_ID:?Missing VAULT_SECRET_ID}"
-: "${SECRET_PATH:?Missing secret path (use --path)}"
+if [[ "$ACTION" != "token_info" && "$ACTION" != "renew_token" ]]; then
+  : "${SECRET_PATH:?Missing secret path (use --path)}"
+fi
 if [[ "$ACTION" == "put" ]]; then
   : "${PUT_VALUE:?Missing value (use --value)}"
 fi
@@ -260,6 +478,7 @@ for bin in curl jq; do
 done
 
 debug "Using VAULT_ADDR=${VAULT_ADDR}"
+debug "Using auth method=${VAULT_AUTH_METHOD}"
 debug "Using mount point=${MOUNT_POINT}"
 debug "Using secret path=${SECRET_PATH}"
 if [[ -n "$SECRET_KEY" ]]; then
@@ -272,8 +491,6 @@ if [[ -n "${VAULT_NAMESPACE:-}" ]]; then
 else
   debug "No namespace configured"
 fi
-debug "Using AppRole role_id=$(mask "$VAULT_ROLE_ID") secret_id=$(mask "$VAULT_SECRET_ID")"
-
 AUTH_HEADERS=(-H "Content-Type: application/json")
 READ_HEADERS=()
 
@@ -282,46 +499,20 @@ if [[ -n "${VAULT_NAMESPACE:-}" ]]; then
   READ_HEADERS+=(-H "X-Vault-Namespace: ${VAULT_NAMESPACE}")
 fi
 
-LOGIN_PAYLOAD="$(jq -n --arg role_id "$VAULT_ROLE_ID" --arg secret_id "$VAULT_SECRET_ID" '{role_id: $role_id, secret_id: $secret_id}')"
-debug "Authenticating with AppRole at ${VAULT_ADDR}/v1/auth/approle/login"
-
-if ! LOGIN_RESP="$({
-  curl -sS \
-    --location \
-    --max-redirs 5 \
-    --post301 \
-    --post302 \
-    --post303 \
-    "${AUTH_HEADERS[@]}" \
-    --request POST \
-    --data "$LOGIN_PAYLOAD" \
-    --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
-    "${VAULT_ADDR}/v1/auth/approle/login"
-})"; then
-  fail "Login request failed (network/TLS/connection issue)"
-fi
-
-LOGIN_REDIRECTS="${LOGIN_RESP##*$'\n'}"
-LOGIN_TMP="${LOGIN_RESP%$'\n'*}"
-LOGIN_EFFECTIVE_URL="${LOGIN_TMP##*$'\n'}"
-LOGIN_TMP="${LOGIN_TMP%$'\n'*}"
-LOGIN_STATUS="${LOGIN_TMP##*$'\n'}"
-LOGIN_BODY="${LOGIN_TMP%$'\n'*}"
-debug "Login response HTTP status=${LOGIN_STATUS}"
-debug "Login effective URL=${LOGIN_EFFECTIVE_URL} redirects=${LOGIN_REDIRECTS}"
-debug "Login response body=${LOGIN_BODY}"
-
-if [[ ! "$LOGIN_STATUS" =~ ^2 ]]; then
-  fail "Vault AppRole login failed with HTTP ${LOGIN_STATUS}"
-fi
-
-if ! TOKEN="$(jq -er '.auth.client_token' <<<"$LOGIN_BODY")"; then
-  fail "Login succeeded but token missing in response"
-fi
+resolve_token
 
 debug "Vault token acquired successfully (masked=$(mask "$TOKEN"), length=${#TOKEN})"
 
 READ_HEADERS+=(-H "X-Vault-Token: ${TOKEN}")
+if [[ "$ACTION" == "token_info" ]]; then
+  show_token_info
+  exit 0
+fi
+if [[ "$ACTION" == "renew_token" ]]; then
+  renew_token
+  exit 0
+fi
+
 READ_URL="${VAULT_ADDR}/v1/${MOUNT_POINT}/data/${SECRET_PATH}"
 if [[ "$ACTION" == "get" ]]; then
   debug "Reading secret from ${READ_URL}"
