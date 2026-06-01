@@ -181,6 +181,10 @@ parse_secret_target() {
   fi
 
   parsed="${parsed#/}"
+  parsed="${parsed//\/\//\/}"
+  while [[ "$parsed" == *"//"* ]]; do
+    parsed="${parsed//\/\//\/}"
+  done
   if [[ "$parsed" == v1/* ]]; then
     parsed="${parsed#v1/}"
   fi
@@ -191,6 +195,8 @@ parse_secret_target() {
 
   parsed_mount="${parsed%%/data/*}"
   parsed_path="${parsed#*/data/}"
+  parsed_path="${parsed_path#/}"
+  parsed_path="${parsed_path%/}"
 
   if [[ -z "$parsed_mount" || -z "$parsed_path" ]]; then
     fail "Unable to parse mount/path from secret target '${raw}'"
@@ -233,6 +239,10 @@ parse_list_target() {
   fi
 
   parsed="${parsed#/}"
+  parsed="${parsed//\/\//\/}"
+  while [[ "$parsed" == *"//"* ]]; do
+    parsed="${parsed//\/\//\/}"
+  done
   if [[ "$parsed" == v1/* ]]; then
     parsed="${parsed#v1/}"
   fi
@@ -246,6 +256,9 @@ parse_list_target() {
   else
     SECRET_PATH="$parsed"
   fi
+
+  SECRET_PATH="${SECRET_PATH#/}"
+  SECRET_PATH="${SECRET_PATH%/}"
 
   if [[ -z "$MOUNT_POINT" || -z "$SECRET_PATH" ]]; then
     fail "Unable to parse mount/path from list target '${raw}'"
