@@ -40,6 +40,7 @@ MOUNT_POINT="${VAULT_MOUNT_POINT:-secret}"
 SECRET_PATH="${VAULT_SECRET_PATH:-}"
 SECRET_KEY="${VAULT_SECRET_KEY:-}"
 GET_SECRET=""
+LIST_SECRETS=""
 PUT_SECRET=""
 PUT_VALUE=""
 KEY_SET="0"
@@ -60,6 +61,7 @@ Usage:
 
 Options:
   --get-secret <path>    Full Vault API path (/v1/<mount>/data/<path>)
+  --list-secrets <path>  List child secret paths under KV v2 metadata path
   --put-secret <path>    Full Vault API path (/v1/<mount>/data/<path>) to write
   --value <value>        Value to write (used with --put-secret)
   --mount-point <name>   KV v2 mount point (default: VAULT_MOUNT_POINT or secret)
@@ -207,6 +209,49 @@ parse_secret_target() {
   fi
 
   debug "Parsed secret target mount=${MOUNT_POINT} path=${SECRET_PATH} key=${SECRET_KEY:-<none>}"
+}
+
+parse_list_target() {
+  local raw="$1"
+  local parsed="$raw"
+  local query=""
+
+  if [[ "$parsed" =~ ^https?://[^/]+(/.*)$ ]]; then
+    parsed="${BASH_REMATCH[1]}"
+  fi
+
+  if [[ "$parsed" == *"#"* ]]; then
+    fail "List path must not include a key fragment (#...). Use a path only."
+  fi
+
+  if [[ "$parsed" == *"?"* ]]; then
+    query="${parsed#*\?}"
+    parsed="${parsed%%\?*}"
+    if [[ "$query" =~ (^|&)key=([^&]+)($|&) ]]; then
+      fail "List path must not include key=... query. Use a path only."
+    fi
+  fi
+
+  parsed="${parsed#/}"
+  if [[ "$parsed" == v1/* ]]; then
+    parsed="${parsed#v1/}"
+  fi
+
+  if [[ "$parsed" == */metadata/* ]]; then
+    MOUNT_POINT="${parsed%%/metadata/*}"
+    SECRET_PATH="${parsed#*/metadata/}"
+  elif [[ "$parsed" == */data/* ]]; then
+    MOUNT_POINT="${parsed%%/data/*}"
+    SECRET_PATH="${parsed#*/data/}"
+  else
+    SECRET_PATH="$parsed"
+  fi
+
+  if [[ -z "$MOUNT_POINT" || -z "$SECRET_PATH" ]]; then
+    fail "Unable to parse mount/path from list target '${raw}'"
+  fi
+
+  debug "Parsed list target mount=${MOUNT_POINT} path=${SECRET_PATH}"
 }
 
 load_env_file() {
@@ -402,6 +447,11 @@ while [[ $# -gt 0 ]]; do
       ACTION="get"
       shift 2
       ;;
+    --list-secrets)
+      LIST_SECRETS="$2"
+      ACTION="list"
+      shift 2
+      ;;
     --put-secret)
       PUT_SECRET="$2"
       ACTION="put"
@@ -453,10 +503,20 @@ if [[ -n "$GET_SECRET" && -n "$PUT_SECRET" ]]; then
   fail "Use either --get-secret or --put-secret, not both"
 fi
 
+if [[ -n "$LIST_SECRETS" && ( -n "$GET_SECRET" || -n "$PUT_SECRET" ) ]]; then
+  fail "Use --list-secrets by itself (do not combine with --get-secret or --put-secret)"
+fi
+
+if [[ "$ACTION" == "list" && "$KEY_SET" == "1" ]]; then
+  fail "--key cannot be used with --list-secrets"
+fi
+
 if [[ -n "$GET_SECRET" ]]; then
   parse_secret_target "$GET_SECRET" "$KEY_SET"
 elif [[ -n "$PUT_SECRET" ]]; then
   parse_secret_target "$PUT_SECRET" "$KEY_SET"
+elif [[ -n "$LIST_SECRETS" ]]; then
+  parse_list_target "$LIST_SECRETS"
 fi
 
 debug "Starting Vault secret retrieval"
@@ -510,6 +570,51 @@ if [[ "$ACTION" == "token_info" ]]; then
 fi
 if [[ "$ACTION" == "renew_token" ]]; then
   renew_token
+  exit 0
+fi
+
+if [[ "$ACTION" == "list" ]]; then
+  LIST_URL="${VAULT_ADDR}/v1/${MOUNT_POINT}/metadata/${SECRET_PATH}?list=true"
+  debug "Listing secrets from ${LIST_URL}"
+
+  if ! LIST_RESP="$({
+    curl -sS \
+      --location \
+      --max-redirs 5 \
+      "${READ_HEADERS[@]}" \
+      --request GET \
+      --write-out $'\n%{http_code}\n%{url_effective}\n%{num_redirects}' \
+      "${LIST_URL}"
+  })"; then
+    fail "Secret list request failed (network/TLS/connection issue)"
+  fi
+
+  LIST_REDIRECTS="${LIST_RESP##*$'\n'}"
+  LIST_TMP="${LIST_RESP%$'\n'*}"
+  LIST_EFFECTIVE_URL="${LIST_TMP##*$'\n'}"
+  LIST_TMP="${LIST_TMP%$'\n'*}"
+  LIST_STATUS="${LIST_TMP##*$'\n'}"
+  LIST_BODY="${LIST_TMP%$'\n'*}"
+  debug "List response HTTP status=${LIST_STATUS}"
+  debug "List effective URL=${LIST_EFFECTIVE_URL} redirects=${LIST_REDIRECTS}"
+  debug "List response body=${LIST_BODY}"
+
+  if [[ ! "$LIST_STATUS" =~ ^2 ]]; then
+    if ERRORS="$(jq -r '.errors[]?' <<<"$LIST_BODY" 2>/dev/null)" && [[ -n "$ERRORS" ]]; then
+      log_line "ERROR" "Vault errors: ${ERRORS}"
+    fi
+    fail "Vault secret list failed with HTTP ${LIST_STATUS}"
+  fi
+
+  jq -e --arg base "$SECRET_PATH" '
+    .data.keys
+    | map(select(type == "string"))
+    | map({
+        key: (if endswith("/") then .[0:-1] else . end),
+        value: (if ($base | length) > 0 then ($base + "/" + .) else . end)
+      })
+    | from_entries
+  ' <<<"$LIST_BODY"
   exit 0
 fi
 
